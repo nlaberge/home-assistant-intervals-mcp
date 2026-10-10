@@ -1,0 +1,151 @@
+name: Build Home Assistant app
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run app supervisor tests
+        run: python -m unittest discover -s intervals-mcp/tests -v
+
+  prepare:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.app.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      image_name: ${{ steps.app.outputs.image_name }}
+      intervals_version: ${{ steps.app.outputs.intervals_version }}
+      intervals_commit: ${{ steps.app.outputs.intervals_commit }}
+      tunnel_client_version: ${{ steps.app.outputs.tunnel_client_version }}
+      uv_version: ${{ steps.app.outputs.uv_version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read app metadata and verify release tag
+        id: app
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          config = Path("intervals-mcp/config.yaml").read_text()
+          version = re.search(r'^version:\s*"?([^"\n]+)"?\s*$', config, re.MULTILINE)
+          image = re.search(r'^image:\s*(\S+)\s*$', config, re.MULTILINE)
+          if version is None or image is None:
+              raise SystemExit("config.yaml must define version and image")
+          image_name = image.group(1).rsplit("/", 1)[-1]
+          if image_name != "ha-intervals-mcp":
+              raise SystemExit("config.yaml image must end with /ha-intervals-mcp")
+
+          pins = {}
+          for line in Path("versions.env").read_text().splitlines():
+              key, value = line.split("=", 1)
+              pins[key] = value
+
+          release_tag = os.environ.get("RELEASE_TAG", "")
+          if release_tag and release_tag != version.group(1):
+              raise SystemExit(
+                  f"Release tag {release_tag!r} must match app version {version.group(1)!r}"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version.group(1)}\n")
+              output.write(f"image_name={image_name}\n")
+              output.write(f"intervals_version={pins['INTERVALS_VERSION']}\n")
+              output.write(f"intervals_commit={pins['INTERVALS_COMMIT']}\n")
+              output.write(f"tunnel_client_version={pins['TUNNEL_CLIENT_VERSION']}\n")
+              output.write(f"uv_version={pins['UV_VERSION']}\n")
+          PY
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+
+      - name: Prepare architecture matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.09.0
+        with:
+          architectures: '["amd64", "aarch64"]'
+          image-name: ${{ steps.app.outputs.image_name }}
+          registry-prefix: ghcr.io/${{ github.repository_owner }}
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build app image
+        uses: home-assistant/builder/actions/build-image@2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          context: ./intervals-mcp
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          labels: |
+            io.hass.type=app
+            io.hass.arch=${{ matrix.arch }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            INTERVALS_VERSION=${{ needs.prepare.outputs.intervals_version }}
+            INTERVALS_COMMIT=${{ needs.prepare.outputs.intervals_commit }}
+            TUNNEL_CLIENT_VERSION=${{ needs.prepare.outputs.tunnel_client_version }}
+            UV_VERSION=${{ needs.prepare.outputs.uv_version }}
+          push: ${{ github.event_name == 'release' }}
+          version: ${{ needs.prepare.outputs.version }}
+
+  manifest:
+    needs:
+      - prepare
+      - build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: write
+    steps:
+      - name: Publish signed multi-architecture manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.09.0
+        with:
+          architectures: '["amd64", "aarch64"]'
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ needs.prepare.outputs.image_name }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          registry-prefix: ghcr.io/${{ github.repository_owner }}

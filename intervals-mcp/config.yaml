@@ -1,0 +1,23 @@
+name: Intervals.icu MCP Secure Tunnel
+version: "0.1.0"
+slug: intervals-mcp-secure-tunnel
+description: Private Intervals.icu MCP access through your existing OpenAI Secure MCP Tunnel.
+url: https://github.com/nlaberge/home-assistant-intervals-mcp
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+options:
+  openai_tunnel_id: ""
+  openai_runtime_api_key: ""
+  intervals_icu_api_key: ""
+  intervals_icu_athlete_id: ""
+  intervals_icu_delete_mode: safe
+schema:
+  openai_tunnel_id: str
+  openai_runtime_api_key: password
+  intervals_icu_api_key: password
+  intervals_icu_athlete_id: str
+  intervals_icu_delete_mode: "match(^(safe|full|none)$)"
+image: ghcr.io/nlaberge/ha-intervals-mcp
