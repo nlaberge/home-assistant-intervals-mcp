@@ -1,0 +1,7 @@
+{
+  "openai_tunnel_id": "REPLACE_WITH_EXISTING_TUNNEL_ID",
+  "openai_runtime_api_key": "REPLACE_WITH_OPENAI_RUNTIME_API_KEY",
+  "intervals_icu_api_key": "REPLACE_WITH_INTERVALS_ICU_API_KEY",
+  "intervals_icu_athlete_id": "REPLACE_WITH_ATHLETE_ID",
+  "intervals_icu_delete_mode": "safe"
+}

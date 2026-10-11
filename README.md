@@ -105,4 +105,24 @@ To test the ARM64 image from an x86_64 machine, use a Buildx/QEMU-enabled Docker
 PLATFORM=linux/arm64 sh scripts/build-image.sh
 ```
 
-This validates an image build, not operation on a Home Assistant Green.
+To exercise the app locally through your existing tunnel:
+
+1. Stop the Home Assistant app and ensure the Mac tunnel-client is stopped. Only one client may use this tunnel ID at a time.
+2. Copy `docker-options.example.json` to a file outside the repository, for example `/tmp/ha-intervals-mcp-options.json`. Replace the placeholders in the copy with your existing tunnel ID and credentials; leave `intervals_icu_delete_mode` set to `safe`. Do not edit the example with real credentials or paste credentials into chat.
+3. Restrict the copy to your account:
+
+   ```sh
+   chmod 600 /tmp/ha-intervals-mcp-options.json
+   ```
+
+4. Run the locally built image without publishing ports:
+
+   ```sh
+   docker run --rm --name intervals-mcp-local \
+     --mount type=bind,src=/tmp/ha-intervals-mcp-options.json,dst=/data/options.json,readonly \
+     ha-intervals-mcp:local
+   ```
+
+5. While the container runs, try one read-only request through the existing ChatGPT connector. Watch the container output for initialization warnings and the MCP tool probe result. Press `Ctrl+C` to stop the test, then remove the credential copy and restart the Home Assistant app.
+
+The example file contains placeholders only. The real credential file should remain outside the repository and must never be committed or shared. This validates the app image and live tunnel path, but not installation or operation on a physical Home Assistant Green.
