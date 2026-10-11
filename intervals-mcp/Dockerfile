@@ -36,7 +36,7 @@ LABEL \
     io.hass.type="app" \
     org.opencontainers.image.title="Home Assistant Intervals.icu MCP Secure Tunnel" \
     org.opencontainers.image.description="Intervals.icu MCP server and OpenAI Secure MCP Tunnel client" \
-    org.opencontainers.image.version="0.1.2" \
+    org.opencontainers.image.version="0.1.3" \
     org.opencontainers.image.source="https://github.com/nlaberge/home-assistant-intervals-mcp" \
     org.opencontainers.image.vendor="Personal Home Assistant app"
 
@@ -56,6 +56,8 @@ COPY --from=tunnel-client /usr/bin/tunnel-client /usr/bin/tunnel-client
 WORKDIR /opt/intervals
 COPY run.sh /run.sh
 COPY supervisor.py /opt/intervals/supervisor.py
+COPY run_mcp_server.py /opt/intervals/run_mcp_server.py
+COPY mcp_http.py /opt/intervals/mcp_http.py
 
 RUN chmod 0755 /run.sh \
     && mkdir -p /run/ha-intervals

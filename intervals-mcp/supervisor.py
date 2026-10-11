@@ -7,11 +7,9 @@ import asyncio
 import json
 import logging
 import os
-import queue
 import signal
-import subprocess
+import socket
 import sys
-import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,11 +20,14 @@ from urllib.request import Request, urlopen
 OPTIONS_PATH = Path("/data/options.json")
 HEALTH_PATH = Path("/run/ha-intervals/health.json")
 TUNNEL_HEALTH_URL = "http://127.0.0.1:8766"
+MCP_HTTP_URL = "http://127.0.0.1:8765/mcp"
+MCP_HTTP_HOST = "127.0.0.1"
+MCP_HTTP_PORT = 8765
 HEALTH_INTERVAL_SECONDS = 30
 TOOL_PROBE_INTERVAL_SECONDS = 900
 TOOL_PROBE_MAX_AGE_SECONDS = TOOL_PROBE_INTERVAL_SECONDS * 2
 MAX_RESTART_DELAY_SECONDS = 60
-MCP_PROTOCOL_VERSION = "2025-03-26"
+MCP_PROTOCOL_VERSION = "2025-11-25"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,20 +86,30 @@ def tunnel_command(env: dict[str, str]) -> tuple[str, ...]:
     return (
         "/usr/bin/tunnel-client",
         "run",
-        "--mcp-command",
-        "/opt/intervals/.venv/bin/python -m intervals_icu_mcp.server --transport stdio",
-        "--mcp.stdio-send-initialized-notification",
+        "--mcp.server-url",
+        f"url={MCP_HTTP_URL}",
+        "--mcp.extra-headers",
+        "Content-Type: application/json",
+        "--mcp.extra-headers",
+        "Accept: application/json, text/event-stream",
+        "--mcp.startup-wait-timeout",
+        "60s",
         "--health.listen-addr",
         env["HEALTH_LISTEN_ADDR"],
         "--health.show-details=true",
     )
 
 
-def mcp_process_health(component: dict[str, Any]) -> tuple[bool, bool]:
-    details = component.get("details")
-    process_running = isinstance(details, dict) and details.get("child_state") == "running"
-    healthy = component.get("status") == "ok" and process_running
-    return process_running, healthy
+def mcp_server_command() -> tuple[str, ...]:
+    return ("/opt/intervals/.venv/bin/python", "/opt/intervals/run_mcp_server.py")
+
+
+def mcp_http_listener_healthy() -> bool:
+    try:
+        with socket.create_connection((MCP_HTTP_HOST, MCP_HTTP_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
 
 
 def redact(text: str, secrets: tuple[str, ...]) -> str:
@@ -133,117 +144,42 @@ def validate_tool_response(result: dict[str, Any] | None) -> None:
         raise ValueError("MCP tool did not return a successful data response")
 
 
-def probe_mcp_tool(env: dict[str, str]) -> None:
-    initialize = {
+def probe_mcp_tool() -> None:
+    payload = {
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "ha-intervals-healthcheck", "version": "1.0.0"},
-        },
-    }
-    initialized_notification = {
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-        "params": {},
-    }
-    tool_call = {
-        "jsonrpc": "2.0",
-        "id": 2,
         "method": "tools/call",
         "params": {"name": "icu_get_athlete_profile", "arguments": {}},
     }
-    command = (
-        "/opt/intervals/.venv/bin/python",
-        "-m",
-        "intervals_icu_mcp.server",
-        "--transport",
-        "stdio",
+    request = Request(
+        MCP_HTTP_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        },
     )
-    probe_env = {
-        key: env[key]
-        for key in (
-            "PATH",
-            "INTERVALS_ICU_API_KEY",
-            "INTERVALS_ICU_ATHLETE_ID",
-            "INTERVALS_ICU_DELETE_MODE",
-        )
-        if key in env
-    }
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=probe_env,
-        text=True,
-        bufsize=1,
-    )
-    if process.stdin is None or process.stdout is None:
-        process.kill()
-        process.wait()
-        raise ValueError("MCP stdio health probe could not open process streams")
-
-    responses: queue.Queue[dict[str, Any]] = queue.Queue()
-
-    def read_responses() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(response, dict):
-                responses.put(response)
-
-    reader = threading.Thread(target=read_responses, daemon=True)
-    reader.start()
-
-    def send(message: dict[str, Any]) -> None:
-        assert process.stdin is not None
-        process.stdin.write(json.dumps(message) + "\n")
-        process.stdin.flush()
-
-    def receive(request_id: int) -> dict[str, Any]:
-        deadline = time.monotonic() + 25
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("MCP stdio health probe timed out")
-            try:
-                response = responses.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise TimeoutError("MCP stdio health probe timed out") from exc
-            if response.get("id") == request_id:
-                return response
-
     try:
-        send(initialize)
-        initialized = receive(1)
-        if "error" in initialized:
-            raise ValueError("MCP initialize failed")
-        send(initialized_notification)
-        send(tool_call)
-        validate_tool_response(receive(2))
-    finally:
-        try:
-            process.stdin.close()
-        except BrokenPipeError:
-            pass
-        try:
-            return_code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                return_code = process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait()
-        reader.join(timeout=1)
-    if return_code != 0:
-        raise ValueError("MCP stdio health probe process failed")
+        with urlopen(request, timeout=25) as response:
+            if response.status != 200:
+                raise ValueError("MCP HTTP health probe returned an unexpected status")
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(1_048_576).decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise ValueError("MCP HTTP health probe failed") from None
+
+    if "text/event-stream" in content_type:
+        data_lines = [line[5:].lstrip() for line in body.splitlines() if line.startswith("data:")]
+        body = "\n".join(data_lines)
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MCP HTTP health probe returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise ValueError("MCP HTTP health probe returned an invalid response")
+    validate_tool_response(result)
 
 
 def http_json(url: str, timeout: float = 5) -> tuple[int, dict[str, Any] | None]:
@@ -257,6 +193,15 @@ def http_json(url: str, timeout: float = 5) -> tuple[int, dict[str, Any] | None]
             return response.status, data if isinstance(data, dict) else None
     except HTTPError as exc:
         return exc.code, None
+
+
+def http_status(url: str, timeout: float = 5) -> int:
+    request = Request(url)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.status
+    except HTTPError as exc:
+        return exc.code
 
 
 def write_health(state: dict[str, Any]) -> None:
@@ -284,7 +229,7 @@ def healthcheck_from_state(state: dict[str, Any]) -> bool:
         tool_fresh = time.time() - last_tool_check <= TOOL_PROBE_MAX_AGE_SECONDS
     required = (
         state.get("mcp_process_running") is True,
-        state.get("mcp_stdio_healthy") is True,
+        state.get("mcp_http_listener") is True,
         state.get("tunnel_process_running") is True,
         state.get("tunnel_ready") is True,
         state.get("tunnel_control_plane_status") == "ok",
@@ -327,8 +272,8 @@ async def run_service(
             continue
 
         process_state[name] = True
-        if name == "tunnel":
-            process_state["tunnel_generation"] = process_state.get("tunnel_generation", 0) + 1
+        generation_key = f"{name}_generation"
+        process_state[generation_key] = process_state.get(generation_key, 0) + 1
         LOGGER.info("%s process started", name)
         log_task = asyncio.create_task(read_child_logs(name, process, secrets))
         wait_task = asyncio.create_task(process.wait())
@@ -375,9 +320,10 @@ async def monitor_health(
     previous_summary: tuple[Any, ...] | None = None
     last_tool_attempt = 0.0
     observed_tunnel_generation = process_state.get("tunnel_generation", 0)
+    observed_mcp_generation = process_state.get("mcp_generation", 0)
     state: dict[str, Any] = {
         "mcp_process_running": False,
-        "mcp_stdio_healthy": False,
+        "mcp_http_listener": False,
         "tunnel_process_running": False,
         "tunnel_ready": False,
         "tunnel_control_plane_status": "unknown",
@@ -390,19 +336,26 @@ async def monitor_health(
 
     while not stop.is_set():
         current_tunnel_generation = process_state.get("tunnel_generation", 0)
-        if current_tunnel_generation != observed_tunnel_generation:
+        current_mcp_generation = process_state.get("mcp_generation", 0)
+        if (
+            current_tunnel_generation != observed_tunnel_generation
+            or current_mcp_generation != observed_mcp_generation
+        ):
             observed_tunnel_generation = current_tunnel_generation
+            observed_mcp_generation = current_mcp_generation
             last_tool_attempt = 0.0
             state["mcp_tool_call_succeeded"] = False
             state["mcp_tool_checked_at"] = None
             state["mcp_tool_error"] = "not_checked"
 
+        state["mcp_process_running"] = process_state.get("mcp", False)
+        state["mcp_http_listener"] = await asyncio.to_thread(mcp_http_listener_healthy)
         state["tunnel_process_running"] = process_state.get("tunnel", False)
 
         try:
-            status, _ = await asyncio.to_thread(http_json, f"{TUNNEL_HEALTH_URL}/readyz")
+            status = await asyncio.to_thread(http_status, f"{TUNNEL_HEALTH_URL}/readyz")
             state["tunnel_ready"] = status == 200
-        except (OSError, URLError, HTTPError, ValueError, TimeoutError):
+        except (OSError, URLError, HTTPError, TimeoutError):
             state["tunnel_ready"] = False
 
         try:
@@ -424,30 +377,22 @@ async def monitor_health(
             )
             if status == 200 and mcp_component:
                 state["tunnel_mcp_status"] = str(mcp_component.get("status", "unknown"))
-                state["mcp_process_running"], state["mcp_stdio_healthy"] = (
-                    mcp_process_health(mcp_component)
-                )
             else:
                 state["tunnel_mcp_status"] = f"http_{status}"
-                state["mcp_process_running"] = False
-                state["mcp_stdio_healthy"] = False
         except (OSError, URLError, HTTPError, ValueError, TimeoutError) as exc:
             state["tunnel_mcp_status"] = type(exc).__name__
-            state["mcp_process_running"] = False
-            state["mcp_stdio_healthy"] = False
 
         now = time.time()
-        if now - last_tool_attempt >= TOOL_PROBE_INTERVAL_SECONDS and state["mcp_stdio_healthy"]:
+        if now - last_tool_attempt >= TOOL_PROBE_INTERVAL_SECONDS and state["mcp_http_listener"]:
             last_tool_attempt = now
             try:
-                await asyncio.to_thread(probe_mcp_tool, env)
+                await asyncio.to_thread(probe_mcp_tool)
             except (
                 OSError,
                 URLError,
                 HTTPError,
                 ValueError,
                 TimeoutError,
-                subprocess.TimeoutExpired,
             ) as exc:
                 state["mcp_tool_call_succeeded"] = False
                 state["mcp_tool_error"] = type(exc).__name__
@@ -462,7 +407,7 @@ async def monitor_health(
         write_health(state)
         summary = (
             state["mcp_process_running"],
-            state["mcp_stdio_healthy"],
+            state["mcp_http_listener"],
             state["tunnel_process_running"],
             state["tunnel_ready"],
             state["tunnel_control_plane_status"],
@@ -471,7 +416,7 @@ async def monitor_health(
         )
         if summary != previous_summary:
             LOGGER.info(
-                "Health: mcp_process=%s mcp_stdio=%s tunnel_process=%s tunnel_ready=%s "
+                "Health: mcp_process=%s mcp_http_listener=%s tunnel_process=%s tunnel_ready=%s "
                 "control_plane=%s tunnel_mcp=%s mcp_tool_call=%s",
                 *summary,
             )
@@ -500,15 +445,21 @@ async def run() -> int:
 
     client_command = tunnel_command(env)
 
-    LOGGER.info("Starting OpenAI Secure MCP Tunnel with the private Intervals.icu MCP server over STDIO")
+    LOGGER.info("Starting stateless HTTP Intervals.icu MCP server and OpenAI Secure MCP Tunnel")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    process_state: dict[str, Any] = {"tunnel": False, "tunnel_generation": 0}
+    process_state: dict[str, Any] = {
+        "mcp": False,
+        "mcp_generation": 0,
+        "tunnel": False,
+        "tunnel_generation": 0,
+    }
     services = (
+        asyncio.create_task(run_service("mcp", mcp_server_command(), env, secrets, process_state, stop)),
         asyncio.create_task(run_service("tunnel", client_command, env, secrets, process_state, stop)),
         asyncio.create_task(monitor_health(process_state, env, stop)),
     )

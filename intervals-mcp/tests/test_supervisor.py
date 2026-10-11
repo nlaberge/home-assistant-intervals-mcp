@@ -1,4 +1,4 @@
-from io import StringIO
+import asyncio
 import json
 import sys
 import tempfile
@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import supervisor
+import mcp_http
 
 
 class SupervisorTests(unittest.TestCase):
@@ -29,33 +30,92 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn("MCP_SERVER_URL", env)
         self.assertEqual(env["INTERVALS_ICU_DELETE_MODE"], "safe")
 
-    def test_tunnel_runs_mcp_server_over_stdio(self):
+    def test_tunnel_targets_local_stateless_http_server(self):
         command = supervisor.tunnel_command({"HEALTH_LISTEN_ADDR": "127.0.0.1:8766"})
-        self.assertEqual(command[0:3], ("/usr/bin/tunnel-client", "run", "--mcp-command"))
+        self.assertEqual(command[0:3], ("/usr/bin/tunnel-client", "run", "--mcp.server-url"))
+        self.assertEqual(command[3], "url=http://127.0.0.1:8765/mcp")
+        self.assertIn("--mcp.extra-headers", command)
+        extra_headers = [
+            command[index + 1]
+            for index, item in enumerate(command[:-1])
+            if item == "--mcp.extra-headers"
+        ]
         self.assertEqual(
-            command[3],
-            "/opt/intervals/.venv/bin/python -m intervals_icu_mcp.server --transport stdio",
+            extra_headers,
+            [
+                "Content-Type: application/json",
+                "Accept: application/json, text/event-stream",
+            ],
         )
-        self.assertIn("--mcp.stdio-send-initialized-notification", command)
-        self.assertNotIn("--mcp.server-url", command)
+        self.assertIn("--mcp.startup-wait-timeout", command)
+        self.assertNotIn("--mcp-command", command)
+        self.assertNotIn("--mcp.stdio-send-initialized-notification", command)
 
-    def test_mcp_component_reports_managed_stdio_child(self):
+    def test_mcp_server_command_starts_local_wrapper(self):
         self.assertEqual(
-            supervisor.mcp_process_health(
-                {"status": "ok", "details": {"child_state": "running"}}
-            ),
-            (True, True),
+            supervisor.mcp_server_command(),
+            ("/opt/intervals/.venv/bin/python", "/opt/intervals/run_mcp_server.py"),
         )
+
+    def test_incoming_protocol_version_is_normalized_to_supported_version(self):
+        headers = [
+            (b"MCP-Protocol-Version", b"2026-07-28"),
+            (b"Accept", b"application/json"),
+        ]
+
+        normalized, changed = mcp_http.normalize_protocol_version_headers(headers)
+
+        self.assertTrue(changed)
         self.assertEqual(
-            supervisor.mcp_process_health(
-                {"status": "degraded", "details": {"child_state": "running"}}
-            ),
-            (True, False),
+            normalized,
+            [
+                (b"MCP-Protocol-Version", b"2025-11-25"),
+                (b"Accept", b"application/json"),
+            ],
         )
+
+    def test_unrecognized_protocol_versions_are_not_rewritten(self):
+        headers = [(b"mcp-protocol-version", b"2099-01-01")]
+
+        normalized, changed = mcp_http.normalize_protocol_version_headers(headers)
+
+        self.assertFalse(changed)
+        self.assertEqual(normalized, headers)
+
+    def test_compatibility_middleware_rewrites_mcp_post_header(self):
+        observed_scopes = []
+
+        async def app(scope, receive, send):
+            observed_scopes.append(scope)
+
+        middleware = mcp_http.ProtocolVersionCompatibilityMiddleware(app)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [(b"mcp-protocol-version", b"2026-07-28")],
+        }
+        asyncio.run(middleware(scope, Mock(), Mock()))
+
         self.assertEqual(
-            supervisor.mcp_process_health({"status": "unknown", "details": {}}),
-            (False, False),
+            observed_scopes[0]["headers"],
+            [(b"mcp-protocol-version", b"2025-11-25")],
         )
+
+    def test_mcp_listener_health_distinguishes_connection_failure(self):
+        with patch.object(supervisor.socket, "create_connection"):
+            self.assertTrue(supervisor.mcp_http_listener_healthy())
+        with patch.object(supervisor.socket, "create_connection", side_effect=OSError):
+            self.assertFalse(supervisor.mcp_http_listener_healthy())
+
+    def test_tunnel_readiness_uses_http_status_without_parsing_body(self):
+        response = Mock()
+        response.status = 200
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(supervisor, "urlopen", return_value=response):
+            self.assertEqual(supervisor.http_status("http://127.0.0.1:8766/readyz"), 200)
+        response.read.assert_not_called()
 
     def test_missing_credentials_fail_without_echoing_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,7 +140,7 @@ class SupervisorTests(unittest.TestCase):
     def test_mcp_tool_call_is_required_for_healthy_status(self):
         state = {
             "mcp_process_running": True,
-            "mcp_stdio_healthy": True,
+            "mcp_http_listener": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "ok",
@@ -93,7 +153,7 @@ class SupervisorTests(unittest.TestCase):
     def test_all_layers_must_be_healthy(self):
         state = {
             "mcp_process_running": True,
-            "mcp_stdio_healthy": True,
+            "mcp_http_listener": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "ok",
@@ -108,7 +168,7 @@ class SupervisorTests(unittest.TestCase):
     def test_unhealthy_control_plane_is_reported(self):
         state = {
             "mcp_process_running": True,
-            "mcp_stdio_healthy": True,
+            "mcp_http_listener": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "degraded",
@@ -127,99 +187,42 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(state["status"], "error")
 
     def test_tool_probe_rejects_an_intervals_error_envelope(self):
-        stdout = StringIO(
-            "\n".join(
-                (
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "result": {"protocolVersion": "2025-03-26"},
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 2,
-                            "result": {
-                                "content": [
-                                    {"type": "text", "text": '{"error":{"type":"api_error"}}'}
-                                ],
-                                "isError": False,
-                            },
-                        }
-                    ),
-                )
-            )
+        response = Mock()
+        response.status = 200
+        response.headers = {"Content-Type": "text/event-stream"}
+        response.read.return_value = (
+            b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":'
+            b'[{"type":"text","text":"{\\"error\\":{\\"type\\":\\"api_error\\"}}"}],'
+            b'"isError":false}}\n\n'
         )
-        process = Mock(stdin=Mock(), stdout=stdout)
-        process.wait.return_value = 0
-        process.returncode = 0
-        with patch.object(supervisor.subprocess, "Popen", return_value=process):
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(supervisor, "urlopen", return_value=response):
             with self.assertRaisesRegex(ValueError, "Intervals.icu API"):
-                supervisor.probe_mcp_tool(
-                    {
-                        "INTERVALS_ICU_API_KEY": "secret",
-                        "CONTROL_PLANE_API_KEY": "openai-secret",
-                    }
-                )
+                supervisor.probe_mcp_tool()
 
-    def test_tool_probe_accepts_a_data_response(self):
-        stdout = StringIO(
-            "\n".join(
-                (
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "result": {"protocolVersion": "2025-03-26"},
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 2,
-                            "result": {
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": '{"data":{"profile":{"id":"i123456"}}}',
-                                    }
-                                ],
-                                "isError": False,
-                            },
-                        }
-                    ),
-                )
-            )
+    def test_tool_probe_calls_stateless_http_without_initializing(self):
+        response = Mock()
+        response.status = 200
+        response.headers = {"Content-Type": "text/event-stream"}
+        response.read.return_value = (
+            b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":'
+            b'[{"type":"text","text":"{\\"data\\":{\\"profile\\":{\\"id\\":\\"i123456\\"}}}"}],'
+            b'"isError":false}}\n\n'
         )
-        process = Mock(stdin=Mock(), stdout=stdout)
-        process.wait.return_value = 0
-        process.returncode = 0
-        with patch.object(supervisor.subprocess, "Popen", return_value=process) as popen:
-            supervisor.probe_mcp_tool(
-                {
-                    "PATH": "/usr/bin",
-                    "INTERVALS_ICU_API_KEY": "secret",
-                    "INTERVALS_ICU_ATHLETE_ID": "i123456",
-                    "CONTROL_PLANE_API_KEY": "openai-secret",
-                }
-            )
-        command = popen.call_args.args[0]
-        self.assertEqual(command[-1], "stdio")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(supervisor, "urlopen", return_value=response) as urlopen:
+            supervisor.probe_mcp_tool()
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8765/mcp")
+        self.assertEqual(request.method, "POST")
         self.assertEqual(
-            popen.call_args.kwargs["env"],
-            {
-                "PATH": "/usr/bin",
-                "INTERVALS_ICU_API_KEY": "secret",
-                "INTERVALS_ICU_ATHLETE_ID": "i123456",
-            },
+            [json.loads(request.data)["method"]],
+            ["tools/call"],
         )
-        sent_messages = [json.loads(call.args[0]) for call in process.stdin.write.call_args_list]
-        self.assertEqual(
-            [message.get("method") for message in sent_messages],
-            ["initialize", "notifications/initialized", "tools/call"],
-        )
+        self.assertEqual(request.get_header("Mcp-protocol-version"), "2025-11-25")
 
     def test_pins_match_docker_build_defaults(self):
         root = Path(__file__).resolve().parents[2]
