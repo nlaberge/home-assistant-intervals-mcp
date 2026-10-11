@@ -2,7 +2,7 @@
 
 > **Vibe-coded project:** This repository was created with AI assistance. Review and test the code and configuration carefully before using it, especially before enabling write-capable Intervals.icu tools.
 
-A personal Home Assistant app that runs the upstream [Intervals.icu MCP server](https://github.com/hhopke/intervals-icu-mcp) as a child process of the official [OpenAI Secure MCP Tunnel client](https://github.com/openai/tunnel-client), using STDIO. The tunnel client makes outbound HTTPS connections to OpenAI. The upstream server is used unmodified, retaining its activities, wellness, calendar/planned-workout, and structured workout tools.
+A personal Home Assistant app that runs the upstream [Intervals.icu MCP server](https://github.com/hhopke/intervals-icu-mcp) as a child process of the official [OpenAI Secure MCP Tunnel client](https://github.com/openai/tunnel-client), using STDIO. The tunnel client's STDIO initialized-notification compatibility option is enabled for MCP clients that omit the notification after a successful initialize exchange. It does not synthesize an initialize request. The tunnel client makes outbound HTTPS connections to OpenAI. The upstream server is used unmodified, retaining its activities, wellness, calendar/planned-workout, and structured workout tools.
 
 This app is designed to reuse an existing OpenAI tunnel ID. It does not create a tunnel, change a ChatGPT connector/plugin, or require a public MCP URL, inbound port forwarding, privileged host access, Docker installation on Home Assistant OS, or changes to existing Mac services.
 
@@ -12,7 +12,7 @@ The source is configured for `nlaberge/home-assistant-intervals-mcp`:
 
 1. Create `nlaberge/home-assistant-intervals-mcp` on GitHub and push this local repository.
 2. Enable GitHub Actions and GitHub Container Registry package publishing for the repository. After the first release creates the package, set the GHCR package visibility to **public** so Home Assistant can pull it without registry credentials.
-3. Publish a GitHub Release whose tag exactly matches `intervals-mcp/config.yaml`'s version (currently `0.1.1`, without a leading `v`). The workflow builds and publishes the `amd64` and `aarch64` images and a multi-architecture manifest. Pull requests and pushes to `main` build without publishing.
+3. Publish a GitHub Release whose tag exactly matches `intervals-mcp/config.yaml`'s version (currently `0.1.2`, without a leading `v`). The workflow builds and publishes the `amd64` and `aarch64` images and a multi-architecture manifest. Pull requests and pushes to `main` build without publishing.
 4. Add `https://github.com/nlaberge/home-assistant-intervals-mcp` as a custom app repository in Home Assistant: **Settings → Apps → App store → ⋮ → Repositories**.
 
 Home Assistant Green uses the app architecture `aarch64`; the workflow also builds `amd64` for local development. The upstream tunnel-client release publishes Linux ARM64 images. This repository has not been installed or tested on a physical Home Assistant Green; a successful local or GitHub build is not a device test.
@@ -69,6 +69,7 @@ To inspect logs, open **Settings → Apps → Intervals.icu MCP Secure Tunnel �
 - **Tunnel process runs but is not ready**: verify the tunnel ID is unchanged and correct, the runtime key is valid and has Tunnels Read + Use permissions, and outbound TCP 443 to `api.openai.com` is allowed. Do not use an admin key as the runtime key.
 - **MCP process is healthy but the tool probe fails**: verify the Intervals.icu API key and athlete ID, and check that the Intervals.icu API is reachable. The probe is a read-only athlete profile query.
 - **Tunnel ready but no MCP initialization/tool observations**: check `mcp_stdio` and `tunnel_mcp_status` and ensure the Mac tunnel-client is stopped. STDIO health discovery may not be available until tunnel-client has initialized the server through a request on the existing tunnel.
+- **MCP logs say a request arrived before initialization completed**: confirm the app is updated to `0.1.2` or later so the tunnel-client sends the initialized notification after a successful initialize exchange. If the warning persists, the client may not be sending initialize; collect the app logs for that request before changing versions or connector settings.
 - **A child is repeatedly restarted**: inspect the preceding child log lines for its non-secret startup error and confirm the image's dependency pins have not been changed.
 - **Credentials appear in a log or backup**: stop the app and rotate the exposed key at its issuer before restarting with the replacement.
 

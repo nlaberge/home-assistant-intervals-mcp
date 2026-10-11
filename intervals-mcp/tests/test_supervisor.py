@@ -36,6 +36,7 @@ class SupervisorTests(unittest.TestCase):
             command[3],
             "/opt/intervals/.venv/bin/python -m intervals_icu_mcp.server --transport stdio",
         )
+        self.assertIn("--mcp.stdio-send-initialized-notification", command)
         self.assertNotIn("--mcp.server-url", command)
 
     def test_mcp_component_reports_managed_stdio_child(self):

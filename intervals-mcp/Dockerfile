@@ -36,7 +36,7 @@ LABEL \
     io.hass.type="app" \
     org.opencontainers.image.title="Home Assistant Intervals.icu MCP Secure Tunnel" \
     org.opencontainers.image.description="Intervals.icu MCP server and OpenAI Secure MCP Tunnel client" \
-    org.opencontainers.image.version="0.1.1" \
+    org.opencontainers.image.version="0.1.2" \
     org.opencontainers.image.source="https://github.com/nlaberge/home-assistant-intervals-mcp" \
     org.opencontainers.image.vendor="Personal Home Assistant app"
 

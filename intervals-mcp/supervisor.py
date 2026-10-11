@@ -87,6 +87,7 @@ def tunnel_command(env: dict[str, str]) -> tuple[str, ...]:
         "run",
         "--mcp-command",
         "/opt/intervals/.venv/bin/python -m intervals_icu_mcp.server --transport stdio",
+        "--mcp.stdio-send-initialized-notification",
         "--health.listen-addr",
         env["HEALTH_LISTEN_ADDR"],
         "--health.show-details=true",

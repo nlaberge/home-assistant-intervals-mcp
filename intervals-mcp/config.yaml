@@ -1,5 +1,5 @@
 name: Intervals.icu MCP Secure Tunnel
-version: "0.1.1"
+version: "0.1.2"
 slug: intervals-mcp-secure-tunnel
 description: Private Intervals.icu MCP access through your existing OpenAI Secure MCP Tunnel.
 url: https://github.com/nlaberge/home-assistant-intervals-mcp
