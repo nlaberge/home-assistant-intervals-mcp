@@ -36,14 +36,13 @@ LABEL \
     io.hass.type="app" \
     org.opencontainers.image.title="Home Assistant Intervals.icu MCP Secure Tunnel" \
     org.opencontainers.image.description="Intervals.icu MCP server and OpenAI Secure MCP Tunnel client" \
-    org.opencontainers.image.version="0.1.0" \
+    org.opencontainers.image.version="0.1.1" \
     org.opencontainers.image.source="https://github.com/nlaberge/home-assistant-intervals-mcp" \
     org.opencontainers.image.vendor="Personal Home Assistant app"
 
 ENV PATH="/opt/intervals/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    MCP_SERVER_URL="http://127.0.0.1:8765/mcp" \
     HEALTH_LISTEN_ADDR="127.0.0.1:8766" \
     HEALTH_SHOW_DETAILS="true" \
     LOG_LEVEL="info" \
@@ -61,7 +60,6 @@ COPY supervisor.py /opt/intervals/supervisor.py
 RUN chmod 0755 /run.sh \
     && mkdir -p /run/ha-intervals
 
-EXPOSE 8765/tcp
 HEALTHCHECK --interval=60s --timeout=10s --start-period=5m --retries=3 \
     CMD ["python", "/opt/intervals/supervisor.py", "healthcheck"]
 

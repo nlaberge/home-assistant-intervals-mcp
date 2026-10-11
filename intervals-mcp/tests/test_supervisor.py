@@ -1,10 +1,11 @@
+from io import StringIO
 import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,8 +26,35 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(env["CONTROL_PLANE_API_KEY"], "sk-secret-openai")
         self.assertEqual(env["INTERVALS_ICU_API_KEY"], "secret-icu")
         self.assertEqual(env["INTERVALS_ICU_ATHLETE_ID"], "i123456")
-        self.assertEqual(env["MCP_SERVER_URL"], "http://127.0.0.1:8765/mcp")
+        self.assertNotIn("MCP_SERVER_URL", env)
         self.assertEqual(env["INTERVALS_ICU_DELETE_MODE"], "safe")
+
+    def test_tunnel_runs_mcp_server_over_stdio(self):
+        command = supervisor.tunnel_command({"HEALTH_LISTEN_ADDR": "127.0.0.1:8766"})
+        self.assertEqual(command[0:3], ("/usr/bin/tunnel-client", "run", "--mcp-command"))
+        self.assertEqual(
+            command[3],
+            "/opt/intervals/.venv/bin/python -m intervals_icu_mcp.server --transport stdio",
+        )
+        self.assertNotIn("--mcp.server-url", command)
+
+    def test_mcp_component_reports_managed_stdio_child(self):
+        self.assertEqual(
+            supervisor.mcp_process_health(
+                {"status": "ok", "details": {"child_state": "running"}}
+            ),
+            (True, True),
+        )
+        self.assertEqual(
+            supervisor.mcp_process_health(
+                {"status": "degraded", "details": {"child_state": "running"}}
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            supervisor.mcp_process_health({"status": "unknown", "details": {}}),
+            (False, False),
+        )
 
     def test_missing_credentials_fail_without_echoing_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -51,7 +79,7 @@ class SupervisorTests(unittest.TestCase):
     def test_mcp_tool_call_is_required_for_healthy_status(self):
         state = {
             "mcp_process_running": True,
-            "mcp_http_healthy": True,
+            "mcp_stdio_healthy": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "ok",
@@ -64,7 +92,7 @@ class SupervisorTests(unittest.TestCase):
     def test_all_layers_must_be_healthy(self):
         state = {
             "mcp_process_running": True,
-            "mcp_http_healthy": True,
+            "mcp_stdio_healthy": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "ok",
@@ -79,7 +107,7 @@ class SupervisorTests(unittest.TestCase):
     def test_unhealthy_control_plane_is_reported(self):
         state = {
             "mcp_process_running": True,
-            "mcp_http_healthy": True,
+            "mcp_stdio_healthy": True,
             "tunnel_process_running": True,
             "tunnel_ready": True,
             "tunnel_control_plane_status": "degraded",
@@ -98,35 +126,99 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(state["status"], "error")
 
     def test_tool_probe_rejects_an_intervals_error_envelope(self):
-        result = {
-            "result": {
-                "content": [{"type": "text", "text": '{"error":{"type":"api_error"}}'}],
-                "isError": False,
-            }
-        }
-        with patch.object(supervisor, "rpc_request") as rpc:
-            rpc.side_effect = [
-                ({"result": {"protocolVersion": supervisor.MCP_PROTOCOL_VERSION}}, "session-1"),
-                (None, "session-1"),
-                (result, "session-1"),
-            ]
+        stdout = StringIO(
+            "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {"protocolVersion": "2025-03-26"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "result": {
+                                "content": [
+                                    {"type": "text", "text": '{"error":{"type":"api_error"}}'}
+                                ],
+                                "isError": False,
+                            },
+                        }
+                    ),
+                )
+            )
+        )
+        process = Mock(stdin=Mock(), stdout=stdout)
+        process.wait.return_value = 0
+        process.returncode = 0
+        with patch.object(supervisor.subprocess, "Popen", return_value=process):
             with self.assertRaisesRegex(ValueError, "Intervals.icu API"):
-                supervisor.probe_mcp_tool()
+                supervisor.probe_mcp_tool(
+                    {
+                        "INTERVALS_ICU_API_KEY": "secret",
+                        "CONTROL_PLANE_API_KEY": "openai-secret",
+                    }
+                )
 
     def test_tool_probe_accepts_a_data_response(self):
-        result = {
-            "result": {
-                "content": [{"type": "text", "text": '{"data":{"profile":{"id":"i123456"}}}'}],
-                "isError": False,
-            }
-        }
-        with patch.object(supervisor, "rpc_request") as rpc:
-            rpc.side_effect = [
-                ({"result": {"protocolVersion": supervisor.MCP_PROTOCOL_VERSION}}, "session-1"),
-                (None, "session-1"),
-                (result, "session-1"),
-            ]
-            supervisor.probe_mcp_tool()
+        stdout = StringIO(
+            "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {"protocolVersion": "2025-03-26"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": '{"data":{"profile":{"id":"i123456"}}}',
+                                    }
+                                ],
+                                "isError": False,
+                            },
+                        }
+                    ),
+                )
+            )
+        )
+        process = Mock(stdin=Mock(), stdout=stdout)
+        process.wait.return_value = 0
+        process.returncode = 0
+        with patch.object(supervisor.subprocess, "Popen", return_value=process) as popen:
+            supervisor.probe_mcp_tool(
+                {
+                    "PATH": "/usr/bin",
+                    "INTERVALS_ICU_API_KEY": "secret",
+                    "INTERVALS_ICU_ATHLETE_ID": "i123456",
+                    "CONTROL_PLANE_API_KEY": "openai-secret",
+                }
+            )
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-1], "stdio")
+        self.assertEqual(
+            popen.call_args.kwargs["env"],
+            {
+                "PATH": "/usr/bin",
+                "INTERVALS_ICU_API_KEY": "secret",
+                "INTERVALS_ICU_ATHLETE_ID": "i123456",
+            },
+        )
+        sent_messages = [json.loads(call.args[0]) for call in process.stdin.write.call_args_list]
+        self.assertEqual(
+            [message.get("method") for message in sent_messages],
+            ["initialize", "notifications/initialized", "tools/call"],
+        )
 
     def test_pins_match_docker_build_defaults(self):
         root = Path(__file__).resolve().parents[2]
